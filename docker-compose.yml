@@ -1,0 +1,149 @@
+﻿# ==============================================================
+# Proyecto PHP — versión 3: el mismo sistema contra DOS motores
+#
+#   Navegador → FRONT PHP (:8084) → API FACTURAS (:8086) ─┬→ MariaDB
+#   Navegador → phpMyAdmin (:8103) ──────────────────────→┘
+#                                                         └→ PostgreSQL
+#
+# LA FLECHA QUE SE BIFURCA ES TODA LA VERSIÓN. Cuál de los dos motores usa la
+# API lo decide **una variable de entorno** —`MOTOR`—, no un cambio de código.
+# Y el front no se entera: sigue hablando con la misma API por el mismo puerto.
+#
+# Para cambiar de motor:
+#     docker compose up -d --build            (arranca en el motor por defecto)
+#     MOTOR=postgres docker compose up -d     (lo mismo, contra PostgreSQL)
+#
+# En PowerShell:
+#     $env:MOTOR = "postgres"; docker compose up -d
+#
+# Uso: docker compose up -d --build     (UN solo comando)
+# Reset de la BD: docker compose down -v && docker compose up -d
+#
+# LAS FLECHAS DICEN LA ARQUITECTURA. Fíjese en que del front NO sale ninguna
+# flecha hacia MariaDB, y que eso no es un dibujo bonito: es lo que este
+# archivo hace cumplir. `front-php` no tiene ni las credenciales de la base ni
+# el `depends_on` que la mencione, así que aunque alguien escribiera un
+# `new PDO(...)` en el front, no tendría ni con qué ni a dónde conectarse.
+#
+# Este archivo CRECE por versiones: la v4 suma SQL Server.
+# Los puertos cambian en cada versión a propósito: así se pueden tener
+# dos versiones encendidas a la vez y compararlas.
+# ==============================================================
+services:
+
+  # --- MariaDB 11 con la BD bdfacturas COMPLETA (db/init.sql) ---
+  mariadb:
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: paradigmas123
+      MARIADB_DATABASE: bdfacturas_mariadb_local
+      MARIADB_USER: paradigmas
+      MARIADB_PASSWORD: paradigmas123
+    volumes:
+      - mariadbdata:/var/lib/mysql            # los datos sobreviven a `down`
+      - ./db/mariadb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+        # ↑ se ejecuta SOLO con el volumen vacío (primera vez / tras down -v)
+      - ./db/mariadb/init_phpmyadmin.sql:/docker-entrypoint-initdb.d/init_phpmyadmin.sql:ro
+        # ↑ BD interna de phpMyAdmin (habilita el Diseñador y otras extras)
+    ports:
+      - "13328:3306"     # puerto en su PC (para HeidiSQL/DBeaver opcional)
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- PostgreSQL 16 con la MISMA base de datos, en su dialecto ---
+  #
+  # Fíjese en que las dos bases se llaman distinto por dentro
+  # (bdfacturas_mariadb_local y bdfacturas_postgres_local) y tienen las MISMAS
+  # 12 tablas con los MISMOS datos. Eso es lo que hace posible la versión: dos
+  # motores, un solo sistema.
+  postgres:
+    restart: unless-stopped
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bdfacturas_postgres_local
+      POSTGRES_USER: paradigmas
+      POSTGRES_PASSWORD: paradigmas123
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # los datos sobreviven a `down`
+      - ./db/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+        # ↑ se ejecuta SOLO con el volumen vacío (primera vez / tras down -v)
+    ports:
+      - "15464:5432"     # puerto en su PC (para DBeaver/pgAdmin opcional)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paradigmas -d bdfacturas_postgres_local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- API Facturas v1 — PHP puro + PDO ---
+  api-facturas:
+    build: ./api_facturas
+    volumes:
+      - ./api_facturas:/app        # el código montado: guardar un .php = refrescar
+    restart: unless-stopped
+    ports:
+      - "8086:8086"                # http://localhost:8086
+    environment:
+      # ==========================================================
+      # LA VARIABLE QUE DECIDE TODO
+      # ==========================================================
+      # `${MOTOR:-mariadb}` significa: usa la variable MOTOR del entorno, y si
+      # no está, usa "mariadb". Así el comando de siempre sigue funcionando y
+      # cambiar de motor es una palabra:
+      #     $env:MOTOR = "postgres"; docker compose up -d
+      #
+      # Esta variable NO cambia ninguna línea de código. La lee el ensamblador
+      # y con ella escoge qué clase de repositorio construir — es el principio
+      # abierto/cerrado, y este renglón del compose es su examen.
+      MOTOR: ${MOTOR:-mariadb}
+
+      # Los DOS juegos de credenciales viajan siempre, y el ensamblador usa el
+      # que corresponda. Se prefirió esto a tener dos servicios de API porque
+      # el punto de la versión es justamente que **es el mismo programa**.
+      DB_DSN_MARIADB: mysql:host=mariadb;port=3306;dbname=bdfacturas_mariadb_local
+      DB_DSN_POSTGRES: pgsql:host=postgres;port=5432;dbname=bdfacturas_postgres_local
+      DB_USUARIO: paradigmas
+      DB_CLAVE: paradigmas123
+    depends_on:
+      mariadb:
+        condition: service_healthy   # arranca cuando la BD RESPONDE, no por azar
+      postgres:
+        condition: service_healthy
+
+  # --- Front Facturas v1 — PHP puro, la pantalla del usuario ---
+  front-php:
+    build: ./front_php
+    volumes:
+      - ./front_php:/app           # el código montado: guardar un .php = refrescar
+    restart: unless-stopped
+    ports:
+      - "8084:8084"                # http://localhost:8084
+    environment:
+      # Lo ÚNICO que el front necesita saber: dónde está la API. Ni DB_DSN, ni
+      # usuario, ni clave de la base — no las tiene porque no las puede usar.
+      URL_API: http://api-facturas:8086
+      #        ↑ el NOMBRE DEL SERVICIO, no localhost: dentro de un contenedor
+      #          localhost es el contenedor mismo, y ahí no hay ninguna API.
+    depends_on:
+      - api-facturas               # y NO mariadb: el front no sabe que existe
+
+  # --- phpMyAdmin (administrador web de MariaDB, también en Docker) ---
+  phpmyadmin:
+    restart: unless-stopped   # si el PC se reinicia, este servicio revive con Docker
+    image: phpmyadmin:latest
+    environment:
+      PMA_HOST: mariadb              # a cuál servidor se conecta (nombre del servicio)
+      PMA_USER: paradigmas
+      PMA_PASSWORD: paradigmas123
+    ports:
+      - "8103:80"                    # http://localhost:8103
+    depends_on:
+      - mariadb
+
+volumes:
+  mariadbdata:
+  pgdata:
